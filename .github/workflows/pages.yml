@@ -25,6 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      # Pages lets browsers cache files for 10 minutes; versioned URLs make each deploy load fresh.
+      - run: sed -i -E "s/(style\.css|app\.js)\"/\1?v=${GITHUB_SHA::7}\"/" web/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web
