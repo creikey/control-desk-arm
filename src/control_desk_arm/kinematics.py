@@ -28,10 +28,6 @@ BASE_HEIGHT = 0.035
 
 # The claw points down for picking from above (-90 = straight down).
 POINTING_DEG = -80.0
-# The middle of the open claw's grip, relative to the fixed fingertip, in the wrist-roll frame (so it
-# turns with the wrist). Measured with the claw fully open and pointing down; scaled by how far the
-# claw is open, since the jaws meet at the fingertip when it's shut.
-GRIP_OFFSET = np.array([0.033, 0.022, 0.023])
 
 # Joint limits in degrees from the URDF, shrunk slightly to stay off the hard stops.
 LIMITS_DEG = {
@@ -144,12 +140,30 @@ def solve_ik(
     return solution, float(np.linalg.norm(err[:3])), float(math.degrees(abs(err[3]) / pitch_weight))
 
 
-def grip_offset(frames_: list[np.ndarray], open_fraction: float) -> np.ndarray:
-    """Fingertip-to-grip-point vector in the world frame, for a claw `open_fraction` (0..1) open."""
-    return frames_[4][:3, :3] @ (GRIP_OFFSET * float(np.clip(open_fraction, 0.0, 1.0)))
+# The moving jaw is a blade on the gripper hinge (so101_new_calib.urdf). Where its fingertip sits on the
+# blade, and how the gripper reading (0 shut .. 100) maps to the hinge angle, were fitted to camera images
+# of the claw at several openings.
+_HINGE_T = _transform((0.0202, 0.0188, -0.0234), (1.5708, 0.0, 0.0))
+_JAW_DEG_AT_SHUT = -59.3
+_JAW_DEG_PER_UNIT = 1.395
+_MOVING_TIP = np.array([0.0526, -0.0552, 0.0204, 1.0])
 
 
-def grip_point(joints_deg: dict[str, float], open_fraction: float) -> np.ndarray:
-    """The middle of the claw's grip, in the world frame."""
+def moving_tip(frames_: list[np.ndarray], gripper: float) -> np.ndarray:
+    """The moving jaw's fingertip, with the gripper at `gripper` (0 shut .. 100)."""
+    angle = math.radians(_JAW_DEG_AT_SHUT + _JAW_DEG_PER_UNIT * gripper)
+    return (frames_[4] @ _HINGE_T @ _rot_z(angle) @ _MOVING_TIP)[:3]
+
+
+def grip_offset(frames_: list[np.ndarray], gripper: float) -> np.ndarray:
+    """From the fixed fingertip to the grip point: halfway across the gap between the jaws, at fingertip
+    height. (Opened wide, the moving jaw's tip rises well above the fingertips.)"""
+    across = moving_tip(frames_, gripper) - frames_[-1][:3, 3]
+    across[2] = 0.0
+    return across / 2
+
+
+def grip_point(joints_deg: dict[str, float]) -> np.ndarray:
+    """The middle of the gap between the jaws, at fingertip height, in the world frame."""
     f = frames(joints_deg)
-    return f[-1][:3, 3] + grip_offset(f, open_fraction)
+    return f[-1][:3, 3] + grip_offset(f, joints_deg["gripper"])

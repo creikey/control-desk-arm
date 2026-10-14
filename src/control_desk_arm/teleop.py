@@ -17,7 +17,6 @@ import numpy as np
 from control_desk_arm.arm import connect, joint_limits, make_arm, move_to, read_joints, release, send_joints
 from control_desk_arm.camera import CameraPose
 from control_desk_arm.kinematics import (
-    GRIP_OFFSET,
     LIMITS_DEG,
     POINTING_DEG,
     frames,
@@ -39,6 +38,13 @@ PAN_AXIS_X = 0.0388  # where the base turns, in front of the origin (so101_new_c
 ARM_JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
 START_ATTEMPTS = 5
 RECONNECT_AFTER = 15  # consecutive failed ticks (half a second) before reconnecting to the arm
+MEASURE_EVERY = 3  # ticks between readings of where the arm actually is
+LAG_WARN_DEG = 8.0  # log when a joint is this far from where it was told to be
+# Under gravity the servos settle a few degrees short of their goals. While the arm is (nearly) still,
+# each joint's shortfall is added to what it's sent, a bit at a time, so it ends up where it was told.
+SAG_GAIN = 0.3
+SAG_MAX_DEG = 12.0  # cap, so a claw pressing on something can't wind this up
+STILL_DEG = 1.0  # the arm counts as still when no goal moved more than this since the last reading
 
 GRIPPER_OPEN = 90.0
 PITCH_RANGE = (-90.0, -20.0)  # degrees: straight down .. reaching well out
@@ -65,7 +71,7 @@ class Plan:
 
     input: tuple[float, ...]
     ticks: int
-    target: np.ndarray  # where the grip point will end up
+    tip: np.ndarray  # where the fixed fingertip will end up (unaffected by the claw or what it holds)
     path: list[dict[str, float]] | None = None
     pitch: float = POINTING_DEG
     done: threading.Event = field(default_factory=threading.Event)
@@ -84,6 +90,10 @@ class Teleop:
         self.claw = GRIPPER_OPEN
         self.pitch = POINTING_DEG
         self.joints: dict[str, float] = {}  # last commanded
+        self.measured: dict[str, float] = {}  # last read back from the motors: where the arm really is
+        self.measured_at = 0.0  # time.monotonic() of that reading
+        self._sag = dict.fromkeys(ARM_JOINTS, 0.0)  # added to each joint's goal, see SAG_GAIN
+        self._still_since: dict[str, float] = {}  # goals at the last reading
         self.applied = NO_INPUT  # the inputs in effect, whoever is driving
         self._input = NO_INPUT
         self._input_at = 0.0
@@ -140,7 +150,8 @@ class Teleop:
             ticks = len(path)
             inputs = tuple(float(np.clip(v * t * HZ / ticks, -1, 1)) for v in inputs)  # same move, new duration
         self.stop()
-        self._plan = Plan(inputs, ticks, target, path, pitch)
+        tip = frames(path[-1])[-1][:3, 3] if path else target - grip_offset(frames(self.joints), self.claw)
+        self._plan = Plan(inputs, ticks, tip, path, pitch)
         self.applied = inputs
         return self._plan
 
@@ -151,7 +162,10 @@ class Teleop:
         arm pose reaches it. Every joint moves at once, so the arm can't get stuck partway the way a
         straight-line move can; if that would sweep the fingertips toward the table, it goes via a
         raised waypoint."""
-        goal = self._solve(grip, pitch, claw, roll)
+        if np.allclose(grip, self.grip) and pitch == self.pitch and roll == self.joints["wrist_roll"]:
+            goal = {**self.joints, "gripper": claw}  # only the claw changes: leave the arm exactly where it is
+        else:
+            goal = self._solve(grip, pitch, claw, roll)
         if goal is None:
             return None
         start = dict(self.joints)
@@ -171,7 +185,11 @@ class Teleop:
         return path
 
     def _solve(self, grip: np.ndarray, pitch: float, claw: float, roll: float) -> dict[str, float] | None:
-        """The reachable arm pose closest to the current one that puts the grip point at `grip`."""
+        """The reachable arm pose closest to the current one that puts the grip point at `grip`, ending
+        with the claw `claw` open.
+
+        The pose is solved at the current claw opening: opening or closing the claw swings only the moving
+        jaw, so it never moves the arm (the grip point shifts with the jaw instead)."""
         pan = math.degrees(math.atan2(grip[1], grip[0] - PAN_AXIS_X))
         seeds = [self.joints] + [
             {**self.joints, "shoulder_pan": pan, "shoulder_lift": lift, "elbow_flex": elbow, "wrist_flex": 70.0}
@@ -182,7 +200,7 @@ class Teleop:
             for seed in seeds:
                 joints = {**seed, "wrist_roll": roll, "gripper": claw}
                 for _ in range(4):  # the grip offset depends on the final wrist pose
-                    tip = grip - grip_offset(frames(joints), claw / GRIPPER_OPEN)
+                    tip = grip - grip_offset(frames(joints), self.claw)
                     joints, err, _ = solve_ik(tip, pitch, joints, pitch_weight=pitch_weight, limits=self._limits)
                 cost = sum(abs(joints[n] - self.joints[n]) for n in ARM_JOINTS)
                 if err <= IK_TOLERANCE and cost < best_cost:
@@ -208,38 +226,26 @@ class Teleop:
         return float(right), float(away)
 
     @property
-    def plan_target(self) -> np.ndarray | None:
-        plan = self._plan
-        return None if plan is None else plan.target
+    def actual_grip(self) -> np.ndarray:
+        """The grip point where the arm really is (from the motors), not where it was told to go."""
+        return grip_point(self.measured)
+
+    @property
+    def actual_tip(self) -> np.ndarray:
+        """The fixed fingertip, where the arm really is."""
+        return frames(self.measured)[-1][:3, 3]
 
     @property
     def fingertip_z(self) -> float:
-        return float(frames(self.joints)[-1][2, 3])
-
-    def jaw_tips(self) -> tuple[np.ndarray, np.ndarray]:
-        """Where the two jaws grip, at fingertip height: the fixed fingertip, and the point the moving
-        jaw reaches across from it at the current opening. Whatever lies between them gets squeezed.
-
-        The moving jaw hinges about the gripper frame's y axis and the fingers point along its -z, so
-        the jaws close along its x axis (so101_new_calib.urdf).
-        """
-        f = frames(self.joints)
-        fixed = f[-1][:3, 3]
-        width = 2 * GRIP_OFFSET[0] * self.claw / GRIPPER_OPEN
-        return fixed, fixed + self._closing_axis(f) * width
+        return float(frames(self.measured)[-1][2, 3])
 
     def jaw_image_angle(self) -> float:
-        """The line the jaws close along, in degrees counterclockwise from pointing right in the image."""
-        f = frames(self.joints)
+        """Across the jaws (fixed fingertip toward the moving jaw), in degrees counterclockwise from
+        pointing right in the image."""
+        f = frames(self.measured)
         fixed = f[-1][:3, 3]
-        a, b = self.pose.project([fixed, fixed + self._closing_axis(f) * 0.05])
+        a, b = self.pose.project([fixed, fixed + grip_offset(f, 30.0)])  # direction only; any opening will do
         return math.degrees(math.atan2(a[1] - b[1], b[0] - a[0])) % 180
-
-    @staticmethod
-    def _closing_axis(f: list[np.ndarray]) -> np.ndarray:
-        across = f[4][:3, 0].copy()
-        across[2] = 0.0
-        return across / np.linalg.norm(across)
 
     def power_on(self) -> bool:
         """Connect, move to the home pose with the claw open, and start the control loop. Blocking.
@@ -256,7 +262,7 @@ class Teleop:
                     arm, joints = self._open()
                     home = {**joints, "wrist_roll": 0.0, "gripper": GRIPPER_OPEN}
                     for _ in range(4):  # the grip offset depends on the final wrist pose
-                        tip = HOME_GRIP - grip_offset(frames(home), 1.0)
+                        tip = HOME_GRIP - grip_offset(frames(home), GRIPPER_OPEN)
                         home, _, _ = solve_ik(tip, POINTING_DEG, home, limits=self._limits)
                     move_to(arm, home, duration=2.0)
                     break
@@ -267,7 +273,9 @@ class Teleop:
                 self.state = "off"
                 return False
             self._arm, self.claw, self.pitch, self.joints = arm, GRIPPER_OPEN, POINTING_DEG, home
-            self.grip = grip_point(home, 1.0)
+            self.measured = dict(home)
+            self._sag = dict.fromkeys(ARM_JOINTS, 0.0)
+            self.grip = grip_point(home)
             self.state = "on"
             self._thread = threading.Thread(target=self._loop, args=(home,), daemon=True)
             self._thread.start()
@@ -330,12 +338,15 @@ class Teleop:
 
     def _loop(self, joints: dict[str, float]) -> None:
         next_tick = time.perf_counter()
-        failures = 0
+        failures = ticks = 0
         while self.state == "on":
             next_tick += 1 / HZ
             try:
                 joints = self._tick(joints)
                 failures = 0
+                ticks += 1
+                if ticks % MEASURE_EVERY == 0:
+                    self._measure()
             except Exception:
                 failures += 1
                 if failures == 1:
@@ -345,6 +356,29 @@ class Teleop:
                     failures = 0
             time.sleep(max(0.0, next_tick - time.perf_counter()))
             next_tick = max(next_tick, time.perf_counter() - 1 / HZ)
+
+    def _measure(self) -> None:
+        with contextlib.suppress(Exception):
+            self.measured = read_joints(self._arm)
+            self.measured_at = time.monotonic()
+            goals, previous = dict(self.joints), self._still_since
+            self._still_since = goals
+            if not previous or max(abs(goals[n] - previous[n]) for n in ARM_JOINTS) > STILL_DEG:
+                return
+            for n in ARM_JOINTS:
+                short = goals[n] - self.measured[n]
+                self._sag[n] = float(np.clip(self._sag[n] + SAG_GAIN * short, -SAG_MAX_DEG, SAG_MAX_DEG))
+            lag = {n: round(goals[n] - self.measured[n]) for n in ARM_JOINTS
+                   if abs(goals[n] - self.measured[n]) > LAG_WARN_DEG}
+            if lag:
+                log.warning("arm isn't where it was told to be (commanded - actual, deg): %s", lag)
+
+    def _send(self, goal: dict[str, float]) -> None:
+        """Send joint goals, with the sag correction added (and kept inside the joints' ranges)."""
+        sent = dict(goal)
+        for n in ARM_JOINTS:
+            sent[n] = float(np.clip(goal[n] + self._sag[n], *self._limits[n]))
+        send_joints(self._arm, sent)
 
     def _tick(self, joints: dict[str, float]) -> dict[str, float]:
         dt = 1 / HZ
@@ -357,8 +391,8 @@ class Teleop:
                 plan.done.set()
             self.applied = plan.input
             self.claw = goal["gripper"]
-            self.grip = grip_point(goal, self.claw / GRIPPER_OPEN)
-            send_joints(self._arm, goal)
+            self.grip = grip_point(goal)
+            self._send(goal)
             self.joints = goal
             return goal
         if plan:
@@ -379,7 +413,7 @@ class Teleop:
             target = self.grip + (self.right * x + self.away * y) * MOVE_SPEED * dt
             target[2] += z * Z_SPEED * dt
             pitch = float(np.clip(self.pitch + tilt * TILT_SPEED * dt, *PITCH_RANGE))
-            tip = target - grip_offset(frames(joints), self.claw / GRIPPER_OPEN)
+            tip = target - grip_offset(frames(joints), self.claw)
             solved, err, _ = solve_ik(tip, pitch, joints, limits=self._limits, iterations=30)
             if err <= IK_TOLERANCE:
                 self.pitch = pitch
@@ -395,9 +429,12 @@ class Teleop:
             lo, hi = self._limits["wrist_roll"]
             goal["wrist_roll"] = float(np.clip(goal["wrist_roll"] + wrist * WRIST_SPEED * dt, lo, hi))
 
-        self.claw = float(np.clip(self.claw + grip * GRIP_SPEED * dt, 0.0, GRIPPER_OPEN))
+        if grip:  # the moving jaw swings and the grip point (midway between the jaws) goes with it
+            self.claw = float(np.clip(self.claw + grip * GRIP_SPEED * dt, 0.0, GRIPPER_OPEN))
+            goal["gripper"] = self.claw
+            self.grip = grip_point(goal)
         goal["gripper"] = self.claw
-        send_joints(self._arm, goal)
+        self._send(goal)
         self.joints = goal
         return goal
 

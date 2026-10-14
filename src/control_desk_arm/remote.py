@@ -15,11 +15,10 @@ from pathlib import Path
 
 import aioice.ice
 import av
-import cv2
 import numpy as np
 import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
-from aiortc.contrib.media import MediaRelay
+from aiortc.sdp import candidate_from_sdp
 
 from control_desk_arm.autopilot import Autopilot
 from control_desk_arm.camera import Camera, CameraPose
@@ -33,9 +32,6 @@ SILENT_BOOT_S = 3.0  # the controller's page sends input 20 times a second; sile
 REST_AFTER_S = 60.0  # with nobody in control this long, fold the arm and turn torque off
 MAX_GOAL_CHARS = 500
 PUSH_INTERVAL_S = 0.1  # autopilot updates (token counts, phase) go out at most this often
-MARKER_COLOR = (255, 255, 0)  # cyan (BGR)
-PLAN_COLOR = (255, 0, 255)  # magenta: where an autopilot move is headed
-FOOTPRINT_M = 0.025  # radius of the disk drawn on the table under the claw
 
 log = logging.getLogger("arm-remote")
 
@@ -57,9 +53,7 @@ class CameraTrack(VideoStreamTrack):
 
     async def recv(self) -> av.VideoFrame:
         pts, time_base = await self.next_timestamp()
-        # Convert once here: each viewer's encoder would otherwise convert this same shared frame on its
-        # own thread at the same time, which crashes PyAV.
-        frame = av.VideoFrame.from_ndarray(self.render(), format="bgr24").reformat(format="yuv420p")
+        frame = av.VideoFrame.from_ndarray(self.render(), format="bgr24")
         frame.pts, frame.time_base = pts, time_base
         return frame
 
@@ -71,8 +65,6 @@ class Remote:
         self.autopilot = Autopilot(self.teleop, self.render, self._autopilot_changed)
         self.last_push = 0.0
         self.push_pending = False
-        self.track = CameraTrack(self.render)
-        self.relay = MediaRelay()
         self.peers: dict[str, RTCPeerConnection] = {}
         self.channels: dict[str, object] = {}
         self.controller: str | None = None
@@ -83,40 +75,9 @@ class Remote:
         self.ws = None
 
     def render(self) -> np.ndarray:
-        """The webcam with the claw marked: a footprint on the table under it, the grip point above that,
-        and the two jaw fingertips. A planned autopilot move's target is marked in magenta."""
+        """The latest webcam frame."""
         img = self.camera.latest_frame()
-        img = np.zeros((480, 640, 3), np.uint8) if img is None else img.copy()
-        if self.teleop.grip is None:
-            return img
-        plan = self.teleop.plan_target
-        if plan is not None:
-            self._draw_footprint(img, plan, PLAN_COLOR, fill=False)
-        self._draw_footprint(img, self.teleop.grip, MARKER_COLOR, fill=True)
-        fixed, moving = self.pose.project(self.teleop.jaw_tips()).astype(int)
-        cv2.line(img, tuple(fixed), tuple(moving), (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.line(img, tuple(fixed), tuple(moving), (255, 255, 255), 2, cv2.LINE_AA)
-        for tip in (fixed, moving):
-            cv2.circle(img, tuple(tip), 5, (0, 0, 0), -1, cv2.LINE_AA)
-            cv2.circle(img, tuple(tip), 4, (255, 255, 255), -1, cv2.LINE_AA)
-        for point, color in ((plan, PLAN_COLOR), (self.teleop.grip, MARKER_COLOR)):
-            if point is not None:
-                cv2.circle(img, tuple(self.pose.project([point])[0].astype(int)), 6, color, 2, cv2.LINE_AA)
-        return img
-
-    def _draw_footprint(self, img: np.ndarray, point: np.ndarray, color, fill: bool) -> None:
-        """A disk on the table under `point`, with a line up to it."""
-        angles = np.linspace(0, 2 * np.pi, 32, endpoint=False)
-        ring = np.stack([point[0] + FOOTPRINT_M * np.cos(angles), point[1] + FOOTPRINT_M * np.sin(angles),
-                         np.zeros_like(angles)], axis=1)
-        outline = self.pose.project(ring).astype(np.int32)
-        if fill:
-            shade = img.copy()
-            cv2.fillPoly(shade, [outline], color, cv2.LINE_AA)
-            cv2.addWeighted(shade, 0.3, img, 0.7, 0, dst=img)
-        cv2.polylines(img, [outline], True, color, 1, cv2.LINE_AA)
-        top, floor = self.pose.project([point, (point[0], point[1], 0.0)]).astype(int)
-        cv2.line(img, tuple(top), tuple(floor), color, 1, cv2.LINE_AA)
+        return np.zeros((480, 640, 3), np.uint8) if img is None else img.copy()
 
     async def run(self) -> None:
         token = TOKEN_FILE.read_text().strip()
@@ -142,6 +103,11 @@ class Remote:
             self.ice = [RTCIceServer(**s) for s in msg["iceServers"]]
         elif kind == "offer":
             await self._answer(peer, msg["sdp"])
+        elif kind == "candidate" and peer in self.peers and msg.get("candidate"):
+            # Browsers send their network candidates one by one as they find them.
+            candidate = candidate_from_sdp(msg["candidate"].removeprefix("candidate:"))
+            candidate.sdpMid, candidate.sdpMLineIndex = msg.get("sdpMid"), msg.get("sdpMLineIndex")
+            await self.peers[peer].addIceCandidate(candidate)
         elif kind == "bye":
             await self._drop(peer)
 
@@ -149,7 +115,9 @@ class Remote:
         await self._drop(peer)
         pc = RTCPeerConnection(RTCConfiguration(iceServers=self.ice))
         self.peers[peer] = pc
-        pc.addTrack(self.relay.subscribe(self.track, buffered=False))
+        # Each viewer gets its own track: encoders run on their own threads, and sharing frames between
+        # them corrupts the encoding (and has crashed PyAV).
+        pc.addTrack(CameraTrack(self.render))
 
         @pc.on("datachannel")
         def on_datachannel(channel):

@@ -46,6 +46,9 @@ async function connectPeer() {
     video.srcObject = e.streams[0] || new MediaStream([e.track]);
     video.play().catch(() => {});
   };
+  peer.oniceconnectionstatechange = () => {
+    if (peer === pc && peer.connectionState !== "connected") show(`connecting video… (${peer.iceConnectionState})`);
+  };
   peer.onconnectionstatechange = () => {
     if (peer !== pc) return;
     if (peer.connectionState === "connected") {
@@ -61,18 +64,20 @@ async function connectPeer() {
   dc.onmessage = (e) => onRobot(JSON.parse(e.data));
   dc.onclose = () => { state = {}; render(); };
 
-  // The robot doesn't take candidates one by one, so they all go in the offer. Rather than wait for
-  // gathering to formally finish (slow), send once the candidate that matters most has arrived.
-  const hasTurn = iceServers.some((s) => [].concat(s.urls).some((u) => u.startsWith("turn")));
-  const wanted = hasTurn ? " typ relay" : " typ srflx";
+  // Network candidates go to the robot as they're found, after the offer (Safari leaves them out of it).
+  const early = [];
+  let offered = false;
+  peer.onicecandidate = (e) => {
+    if (!e.candidate || !e.candidate.candidate || peer !== pc) return;
+    const { candidate, sdpMid, sdpMLineIndex } = e.candidate;
+    const msg = JSON.stringify({ type: "candidate", candidate, sdpMid, sdpMLineIndex });
+    offered ? ws.send(msg) : early.push(msg);
+  };
   await peer.setLocalDescription(await peer.createOffer());
-  await new Promise((done) => {
-    if (peer.iceGatheringState === "complete") return done();
-    peer.onicegatheringstatechange = () => peer.iceGatheringState === "complete" && done();
-    peer.onicecandidate = (e) => e.candidate && e.candidate.candidate.includes(wanted) && setTimeout(done, 100);
-    setTimeout(done, 3000);
-  });
-  if (peer === pc) ws.send(JSON.stringify({ type: "offer", sdp: peer.localDescription.sdp }));
+  if (peer !== pc) return;
+  ws.send(JSON.stringify({ type: "offer", sdp: peer.localDescription.sdp }));
+  offered = true;
+  for (const msg of early) ws.send(msg);
 }
 
 async function showRoute(peer) {
