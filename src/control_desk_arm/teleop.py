@@ -120,6 +120,18 @@ class Teleop:
         self.applied = inputs
         return self._plan
 
+    def table_point(self, u: float, v: float) -> np.ndarray:
+        """The point on the table (z = 0) seen at image pixel (u, v)."""
+        R, t = self.pose.R, self.pose.tvec
+        center = -R.T @ t
+        ray = R.T @ np.linalg.solve(self.pose.K, [u, v, 1.0])
+        return center + ray * (-center[2] / ray[2])
+
+    def table_offset(self, delta: np.ndarray) -> tuple[float, float]:
+        """Split a horizontal move into its `right` and `away` parts (meters)."""
+        right, away = np.linalg.solve(np.column_stack([self.right[:2], self.away[:2]]), delta[:2])
+        return float(right), float(away)
+
     @property
     def plan_target(self) -> np.ndarray | None:
         plan = self._plan

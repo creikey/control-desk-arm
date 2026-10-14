@@ -33,7 +33,13 @@ KEEP_MEDIA = 2  # older observations drop their image or video
 
 SYSTEM_PROMPT = """You drive a small robot arm on a desk to accomplish the user's goal. You see the same webcam view as the people watching. The cyan ring marks the claw's grip point (the middle of the open claw); the cyan line drops from it straight down to a dot on the table, directly below the claw. The short white bar through the ring is the line the two jaws close along: an object is only gripped if it sits between the jaws across that bar. While a move runs, a magenta ring and dot show where it is headed.
 
-Each turn, call `move` or, once the goal is done or clearly impossible, `finish`. A move is relative to where the claw is now, in directions on the table as seen in the image:
+The claw reaches about 30 cm out from the robot's base (a little more when tilted out); it can't get to things beyond that.
+
+Each turn, call one tool: `go_over`, `move`, or, once the goal is done or clearly impossible, `finish`.
+
+`go_over` takes a point in the camera image (x from the left edge, y from the top, both 0 to 1000) and moves the claw sideways so the dot under it lands on that spot of the table, keeping its height. Point at where the object sits on the table, at the middle of its base. This is the accurate way to get over an object; use it first, then fine-tune with `move`.
+
+`move` is relative to where the claw is now, in directions on the table as seen in the image:
 - right_cm: toward the right of the image (negative: left).
 - away_cm: away from the camera, up the image (negative: toward the camera).
 - up_cm: up (negative: down).
@@ -42,9 +48,30 @@ Each turn, call `move` or, once the goal is done or clearly impossible, `finish`
 - claw: how open the claw should be, 0 (shut) to 1 (wide open). Leave it out to keep it as is.
 Everything in a move happens at once and arrives together, so split moves when the order matters (for example: open, then lower, then close, then lift). Moves are exact; make small corrections when you're close.
 
-After each move you get a slowed-down video of it and the claw's state. To pick something up: turn the wrist so the bar crosses the object (for a long thin object like a pencil, at a right angle to it; for something round it doesn't matter), put the dot under the claw on the object, open the claw, lower it until the fingertips are about 1 cm above the table (or around the object), close it, then lift and check the object came with it."""
+After each move you get a slowed-down video of it, a close-up of the claw at the end, and the claw's state, including whether the move reached its target (it stops short when the target is out of reach).
+
+To pick something up:
+1. `go_over` the middle of the object, with the claw high enough to clear it.
+2. Turn the wrist so the white bar crosses the object: across a long thin object like a pencil, and straight across two opposite faces of a box or cube (not across its corners). Open the claw fully.
+3. Lower until the fingertips are about 1 cm above the table, so the jaws surround the object's lower half. Check the close-up: the object should sit between the jaws, centered on the bar. Correct with small moves before closing.
+4. Close the claw, lift 5 cm, and check the close-up shows the object held off the table. If it slipped, open, and try again from step 1."""
 
 TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "go_over",
+            "description": "Move the claw sideways so the dot under it lands on this point of the table in the image.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "minimum": 0, "maximum": 1000, "description": "From the left edge."},
+                    "y": {"type": "number", "minimum": 0, "maximum": 1000, "description": "From the top edge."},
+                },
+                "required": ["x", "y"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -129,11 +156,12 @@ class Autopilot:
 
     async def _run(self, goal: str) -> None:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": f"Goal: {goal}"}]
-        observation = ("Camera now.", "image", _jpeg(self.render()))
+        frame = self.render()
+        observation = [("Camera now:", "image", _jpeg(frame)), ("Close-up around the claw:", "image", self._closeup(frame))]
+        result = ""
         try:
             for _ in range(MAX_STEPS):
-                text, kind, data = observation
-                messages.append(_observation_message(f"{text} {self._claw_state()}", kind, data))
+                messages.append(_observation_message(f"{result}{self._claw_state()}", observation))
                 _forget_old_media(messages)
                 message = await self._complete(messages)
                 messages.append(message)
@@ -149,7 +177,11 @@ class Autopilot:
                 if call["function"]["name"] == "finish":
                     self.note = args.get("summary", "done")
                     return
-                observation = ("Video of your move.", "video", await self._execute(args))
+                video, frame, result = await self._execute(call["function"]["name"], args)
+                observation = [
+                    ("Video of your move:", "video", video),
+                    ("Close-up around the claw now:", "image", self._closeup(frame)),
+                ]
             self.note = "stopped after too many steps"
         except asyncio.CancelledError:
             raise
@@ -173,8 +205,23 @@ class Autopilot:
             f"jaws closing along {t.jaw_image_angle():.0f} degrees in the image (counterclockwise from pointing right)."
         )
 
-    async def _execute(self, args: dict) -> bytes:
-        """Run one move, filming the page's view; returns a slowed-down MP4 of it."""
+    def _closeup(self, img: np.ndarray, half: int = 120) -> bytes:
+        """A 2x crop of the frame around the grip point."""
+        u, v = self.teleop.pose.project([self.teleop.grip])[0]
+        h, w = img.shape[:2]
+        x0 = int(np.clip(u - half, 0, w - 2 * half))
+        y0 = int(np.clip(v - half, 0, h - 2 * half))
+        crop = img[y0 : y0 + 2 * half, x0 : x0 + 2 * half]
+        return _jpeg(cv2.resize(crop, (4 * half, 4 * half), interpolation=cv2.INTER_CUBIC))
+
+    async def _execute(self, name: str, args: dict) -> tuple[bytes, np.ndarray, str]:
+        """Run one move, filming the page's view. Returns a slowed-down MP4 of it, the last frame, and
+        a note on whether it got there."""
+        if name == "go_over":
+            h, w = self.render().shape[:2]
+            spot = self.teleop.table_point(float(args["x"]) / 1000 * w, float(args["y"]) / 1000 * h)
+            right, away = self.teleop.table_offset(spot - self.teleop.grip)
+            args = {"right_cm": right * 100, "away_cm": away * 100}
         cm = {key: float(args.get(key) or 0) / 100 for key in ("right_cm", "away_cm", "up_cm")}
         claw = args.get("claw")
         plan = self.teleop.plan_move(
@@ -191,7 +238,9 @@ class Autopilot:
             if len(frames) <= (loop.time() - start) * FPS:
                 frames.append(self.render())
             await asyncio.sleep(0.05)
-        return await asyncio.to_thread(_mp4, frames)
+        short = float(np.linalg.norm(self.teleop.grip - plan.target)) * 100
+        result = f"The move stopped {short:.1f} cm short of its target (out of reach). " if short > 0.5 else ""
+        return await asyncio.to_thread(_mp4, frames), frames[-1], result
 
     async def _complete(self, messages: list[dict]) -> dict:
         for attempt in range(4):
@@ -226,12 +275,18 @@ class Autopilot:
         return message
 
 
-def _observation_message(text: str, kind: str, data: bytes) -> dict:
-    if kind == "image":
-        media = {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(data).decode()}}
-    else:
-        media = {"type": "video_url", "video_url": {"url": "data:video/mp4;base64," + base64.b64encode(data).decode()}}
-    return {"role": "user", "content": [{"type": "text", "text": text}, media]}
+def _observation_message(text: str, media: list[tuple[str, str, bytes]]) -> dict:
+    """The claw's state as text, then each labeled image or video."""
+    content = [{"type": "text", "text": text}]
+    for label, kind, data in media:
+        content.append({"type": "text", "text": label})
+        if kind == "image":
+            url = "data:image/jpeg;base64," + base64.b64encode(data).decode()
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        else:
+            url = "data:video/mp4;base64," + base64.b64encode(data).decode()
+            content.append({"type": "video_url", "video_url": {"url": url}})
+    return {"role": "user", "content": content}
 
 
 def _forget_old_media(messages: list[dict]) -> None:
