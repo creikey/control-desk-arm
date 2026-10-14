@@ -1,0 +1,17 @@
+[project]
+name = "control-desk-arm"
+version = "0.1.0"
+description = "Control a LeRobot SO-100/SO-101 arm on the desk over the web"
+requires-python = ">=3.12"
+dependencies = [
+    "lerobot[feetech]>=0.6.1",
+]
+
+[project.scripts]
+arm-calibrate = "control_desk_arm.cli:calibrate"
+arm-monitor = "control_desk_arm.cli:monitor"
+arm-test = "control_desk_arm.cli:test_motion"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
