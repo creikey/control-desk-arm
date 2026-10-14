@@ -1,0 +1,23 @@
+{
+  "_comment": "Webcam pose relative to the robot base frame (kinematics.py). Fitted with solvePnP from fingertip positions at known joint angles; 640x480 frames.",
+  "image_size": [
+    640,
+    480
+  ],
+  "focal_px": 560,
+  "principal_point": [
+    320,
+    240
+  ],
+  "rvec": [
+    2.305284584743858,
+    0.4927910741218143,
+    -0.32849600226203524
+  ],
+  "tvec": [
+    -0.1443966005472563,
+    -0.011651712294013308,
+    0.5282249641797213
+  ],
+  "mean_reprojection_error_px": 10.6
+}

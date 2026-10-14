@@ -1,0 +1,87 @@
+:root {
+  color-scheme: dark;
+  --bg: #000;
+  --fg: #ddd;
+  --dim: #777;
+  --line: #444;
+  --on: #fff;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.4 ui-monospace, Menlo, Consolas, monospace;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+main {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: env(safe-area-inset-top) 12px env(safe-area-inset-bottom);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 100%;
+}
+#stage { position: relative; margin: 0 -12px; }
+video { display: block; width: 100%; aspect-ratio: 4 / 3; background: #111; object-fit: contain; }
+#status { position: absolute; left: 12px; top: 8px; margin: 0; text-shadow: 0 0 3px #000; }
+#bar { display: flex; align-items: center; gap: 12px; }
+#info { color: var(--dim); }
+#source { margin-left: auto; }
+button, .button {
+  font: inherit;
+  text-decoration: none;
+  color: var(--fg);
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 14px;
+  touch-action: none;
+}
+button:disabled { color: var(--dim); }
+button.held { background: var(--fg); color: var(--bg); }
+#pad { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+#pad[hidden] { display: none; }
+#stick {
+  position: relative;
+  width: 150px;
+  height: 150px;
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  touch-action: none;
+}
+#knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 56px;
+  height: 56px;
+  margin: -28px 0 0 -28px;
+  border-radius: 50%;
+  background: var(--fg);
+  pointer-events: none;
+}
+#buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+#buttons button { padding: 16px 10px; }
+#keys { color: var(--dim); margin: 0; }
+@media (pointer: coarse) { #keys { display: none; } }
+
+/* Phone on its side: video fills the screen, controls float in the corners. */
+@media (orientation: landscape) and (max-height: 520px) {
+  html, body { overflow: hidden; }
+  main { max-width: none; padding: 0; }
+  #keys { display: none; }
+  #stage { margin: 0; height: 100vh; }
+  video { height: 100%; aspect-ratio: auto; }
+  #bar { position: fixed; right: max(12px, env(safe-area-inset-right)); top: 8px; flex-direction: column; align-items: flex-end; gap: 4px; max-width: 40vw; }
+  #info { text-align: right; text-shadow: 0 0 3px #000; color: var(--fg); }
+  #pad { position: fixed; inset: auto 0 0 0; padding: 0 max(16px, env(safe-area-inset-right)) 16px max(16px, env(safe-area-inset-left)); pointer-events: none; }
+  #pad > * { pointer-events: auto; }
+  button { background: rgba(0, 0, 0, 0.45); }
+  #stick { background: rgba(0, 0, 0, 0.25); }
+}

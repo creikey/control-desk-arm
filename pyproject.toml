@@ -4,12 +4,16 @@ version = "0.1.0"
 description = "Control a LeRobot SO-100/SO-101 arm on the desk over the web"
 requires-python = ">=3.12"
 dependencies = [
+    "aiortc>=1.15.0",
     "lerobot[feetech]>=0.6.1",
+    "opencv-python-headless>=4.13",
+    "websockets>=17.2",
 ]
 
 [project.scripts]
 arm-calibrate = "control_desk_arm.cli:calibrate"
 arm-monitor = "control_desk_arm.cli:monitor"
+arm-remote = "control_desk_arm.remote:main"
 arm-test = "control_desk_arm.cli:test_motion"
 
 [build-system]

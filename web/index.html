@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>desk arm</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <p id="status">connecting…</p>
+  </div>
+  <div id="bar">
+    <button id="take" disabled>take control</button>
+    <span id="info"></span>
+    <a id="source" class="button" href="https://github.com/creikey/control-desk-arm">github</a>
+  </div>
+  <div id="pad" hidden>
+    <div id="stick"><div id="knob"></div></div>
+    <div id="buttons">
+      <button data-axis="z" data-dir="1">up</button>
+      <button data-axis="z" data-dir="-1">down</button>
+      <button data-axis="wrist" data-dir="1">wrist ⟲</button>
+      <button data-axis="wrist" data-dir="-1">wrist ⟳</button>
+      <button data-axis="grip" data-dir="1">open</button>
+      <button data-axis="grip" data-dir="-1">close</button>
+    </div>
+  </div>
+  <p id="keys">keys: wasd move · r/f up/down · q/e wrist · o/c open/close</p>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
