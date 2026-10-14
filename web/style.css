@@ -58,9 +58,10 @@ video { display: block; width: 100%; max-height: 100%; aspect-ratio: 4 / 3; back
 @keyframes blink { from { opacity: 0.2; } }
 #bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
 #bar button, #bar .button { white-space: nowrap; }
-#info { color: var(--dim); order: 1; flex-basis: 100%; }
-#info:empty { display: none; }
-#source { margin-left: auto; }
+/* Second row: status on the left, a small github link on the right. */
+#bar::before { content: ""; order: 1; flex-basis: 100%; }
+#info { color: var(--dim); order: 2; flex: 1; }
+#source { order: 3; margin-left: auto; padding: 4px 10px; font-size: 12px; }
 button, .button {
   font: inherit;
   text-decoration: none;
@@ -181,9 +182,10 @@ dialog h2 { margin: 0 0 10px; font-size: 18px; }
   video { height: var(--h); width: calc(var(--h) * 4 / 3); max-width: 62vw; aspect-ratio: auto; }
   #bar { grid-column: 3; grid-row: 1; flex-direction: column; align-items: stretch; gap: 6px; }
   #bar button, #bar .button { padding: 8px 4px; font-size: 12px; text-align: center; }
-  #source { margin-left: 0; }
+  #bar::before { display: none; }
+  #source { margin-left: 0; padding: 8px 4px; }
   .driving #source { display: none; }
-  #info { flex-basis: auto; font-size: 11px; }
+  #info { flex: none; font-size: 11px; }
   #pilot { grid-column: 1; grid-row: 1; font-size: 12px; }
   #pilot-head { white-space: normal; }
   #pilot-goal { display: block; }
