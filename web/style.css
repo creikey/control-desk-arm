@@ -31,8 +31,35 @@ main {
 #stage { position: relative; margin: 0 -12px; flex: 0 1 auto; min-height: 0; display: flex; }
 video { display: block; width: 100%; max-height: 100%; aspect-ratio: 4 / 3; background: #111; object-fit: contain; }
 #status { position: absolute; left: 12px; top: 8px; margin: 0; text-shadow: 0 0 3px #000; }
-#bar { display: flex; align-items: center; gap: 12px; }
-#info { color: var(--dim); }
+/* Shown to everyone while the AI drives. */
+#pilot {
+  flex: none;
+  padding: 6px 10px 8px;
+  border-radius: 8px;
+  color: #fff;
+  background: linear-gradient(110deg, #7b2ff7, #f107a3, #ff7a18, #7b2ff7) 0 0 / 300% 100%;
+  animation: shimmer 4s linear infinite;
+}
+#pilot-head { font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#pilot-goal { font-weight: normal; opacity: 0.85; }
+#pilot-goal::before { content: "· "; }
+#pilot-stats { font-size: 11px; opacity: 0.75; }
+#pilot-phase { font-size: 12px; opacity: 0.95; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#pilot-phase.thinking::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: #fff;
+  animation: blink 0.8s ease-in-out infinite alternate;
+}
+@keyframes blink { from { opacity: 0.2; } }
+#bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+#bar button, #bar .button { white-space: nowrap; }
+#info { color: var(--dim); order: 1; flex-basis: 100%; }
+#info:empty { display: none; }
 #source { margin-left: auto; }
 button, .button {
   font: inherit;
@@ -45,6 +72,7 @@ button, .button {
   touch-action: none;
 }
 button:disabled { color: var(--dim); }
+#take:disabled { border-style: dashed; }
 button.held { background: var(--fg); color: var(--bg); }
 #pad { margin-top: auto; display: flex; justify-content: space-between; align-items: center; gap: 16px; }
 #pad[hidden] { display: none; }
@@ -71,19 +99,103 @@ button.held { background: var(--fg); color: var(--bg); }
 #buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 #buttons button { padding: 16px 10px; }
 #keys { color: var(--dim); margin: 0; }
+
+/* Autopilot: the one loud thing on the page. */
+#auto {
+  color: #fff;
+  font-weight: bold;
+  border: none;
+  background: linear-gradient(110deg, #7b2ff7, #f107a3, #ff7a18, #7b2ff7) 0 0 / 300% 100%;
+  animation: shimmer 4s linear infinite;
+}
+#auto.on {
+  animation: shimmer 1s linear infinite, glow 1.2s ease-in-out infinite alternate;
+}
+@keyframes shimmer { to { background-position: 150% 0; } }
+@keyframes glow {
+  from { box-shadow: 0 0 4px #f107a3; }
+  to { box-shadow: 0 0 18px #f107a3, 0 0 30px #7b2ff7; }
+}
+/* While the AI drives, the pad shows what it's pressing and ignores touches. */
+#pad.auto, #pad.auto * { pointer-events: none; }
+#pad.auto button { color: #e9b8ff; border-color: #7b2ff7; background: rgba(123, 47, 247, 0.12); }
+#pad.auto button.held {
+  color: #fff;
+  border-color: transparent;
+  background: linear-gradient(110deg, #7b2ff7, #f107a3, #ff7a18);
+  box-shadow: 0 0 12px #f107a3;
+}
+#pad.auto #stick { border-color: #7b2ff7; box-shadow: 0 0 16px rgba(123, 47, 247, 0.6) inset; }
+#pad.auto #knob { background: linear-gradient(135deg, #7b2ff7, #f107a3); box-shadow: 0 0 14px #f107a3; }
+#knob { transition: transform 0.15s; }
+
+dialog {
+  width: min(480px, calc(100vw - 24px));
+  max-height: calc(100dvh - 24px);
+  padding: 16px;
+  color: var(--fg);
+  background: #111;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.7); }
+dialog h2 { margin: 0 0 10px; font-size: 18px; }
+#goal {
+  display: block;
+  width: 100%;
+  font: inherit;
+  font-size: 16px; /* smaller text makes iOS zoom in on focus */
+  color: var(--fg);
+  background: #000;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  resize: none;
+  -webkit-user-select: text;
+  user-select: text;
+}
+#ideas { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+#ideas button { padding: 6px 10px; border-radius: 999px; }
+#goal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+#goal-start {
+  color: #fff;
+  font-weight: bold;
+  border: none;
+  background: linear-gradient(110deg, #7b2ff7, #f107a3, #ff7a18);
+}
 @media (pointer: coarse) { #keys { display: none; } }
 @media (hover: hover) and (pointer: fine) { #pad { display: none; } }
 
-/* Phone on its side: video fills the screen, controls float in the corners. */
+/* Phone on its side: banner and joystick | video | buttons, so nothing covers the video. */
 @media (orientation: landscape) and (max-height: 520px) {
-  main { max-width: none; padding: 0; }
+  main {
+    --h: calc(100dvh - 16px);
+    max-width: none;
+    padding: 8px max(8px, env(safe-area-inset-right)) 8px max(8px, env(safe-area-inset-left));
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+    grid-template-rows: auto 1fr auto;
+    gap: 8px;
+  }
+  #stage { grid-column: 2; grid-row: 1 / -1; margin: 0; }
+  video { height: var(--h); width: calc(var(--h) * 4 / 3); max-width: 62vw; aspect-ratio: auto; }
+  #bar { grid-column: 3; grid-row: 1; flex-direction: column; align-items: stretch; gap: 6px; }
+  #bar button, #bar .button { padding: 8px 4px; font-size: 12px; text-align: center; }
+  #source { margin-left: 0; }
+  .driving #source { display: none; }
+  #info { flex-basis: auto; font-size: 11px; }
+  #pilot { grid-column: 1; grid-row: 1; font-size: 12px; }
+  #pilot-head { white-space: normal; }
+  #pilot-goal { display: block; }
+  #pilot-goal::before { content: none; }
+  #pilot-phase { white-space: normal; }
+  #pilot-stats { font-size: 10px; }
+  #pad:not([hidden]) { display: contents; }
+  #stick { grid-column: 1; grid-row: 3; justify-self: center; width: min(140px, 100%); height: auto; aspect-ratio: 1; }
+  #buttons { grid-column: 3; grid-row: 3; gap: 6px; }
+  #buttons button { padding: 10px 2px; font-size: 12px; white-space: nowrap; }
   #keys { display: none; }
-  #stage { margin: 0; flex: 1; }
-  video { height: 100%; aspect-ratio: auto; }
-  #bar { position: fixed; right: max(12px, env(safe-area-inset-right)); top: 8px; flex-direction: column; align-items: flex-end; gap: 4px; max-width: 40vw; }
-  #info { text-align: right; text-shadow: 0 0 3px #000; color: var(--fg); }
-  #pad { position: fixed; inset: auto 0 0 0; padding: 0 max(16px, env(safe-area-inset-right)) 16px max(16px, env(safe-area-inset-left)); pointer-events: none; }
-  #pad > * { pointer-events: auto; }
-  button { background: rgba(0, 0, 0, 0.45); }
-  #stick { background: rgba(0, 0, 0, 0.25); }
+  dialog { width: min(640px, calc(100vw - 24px)); padding: 12px; }
+  #goal { height: 3em; }
+  #ideas { margin: 8px 0; }
 }

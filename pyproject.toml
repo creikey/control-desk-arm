@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aiortc>=1.15.0",
     "lerobot[feetech]>=0.6.1",
+    "openai>=3.31.0",
     "opencv-python-headless>=4.13",
     "websockets>=17.2",
 ]

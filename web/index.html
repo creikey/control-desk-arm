@@ -12,8 +12,14 @@
     <video id="video" autoplay playsinline muted></video>
     <p id="status">connecting…</p>
   </div>
+  <div id="pilot" hidden>
+    <div id="pilot-head">✦ AI driving <span id="pilot-goal"></span></div>
+    <div id="pilot-phase"></div>
+    <div id="pilot-stats"></div>
+  </div>
   <div id="bar">
     <button id="take" disabled>take control</button>
+    <button id="auto" hidden>✦ autopilot</button>
     <span id="info"></span>
     <a id="source" class="button" href="https://github.com/creikey/control-desk-arm">github</a>
   </div>
@@ -26,10 +32,29 @@
       <button data-axis="wrist" data-dir="-1">wrist ⟳</button>
       <button data-axis="grip" data-dir="1">open</button>
       <button data-axis="grip" data-dir="-1">close</button>
+      <button data-axis="tilt" data-dir="-1">tilt in</button>
+      <button data-axis="tilt" data-dir="1">tilt out</button>
     </div>
   </div>
-  <p id="keys">keys: wasd move · r/f up/down · q/e wrist · o/c open/close</p>
+  <p id="keys">keys: wasd move · r/f up/down · q/e wrist · o/c open/close · t/g tilt out/in</p>
 </main>
+<dialog id="goal-dialog">
+  <form id="goal-form" method="dialog">
+    <h2>✦ autopilot</h2>
+    <textarea id="goal" rows="3" maxlength="500" placeholder="pick up the pencil and drop it on the left"></textarea>
+    <div id="ideas">
+      <button type="button">pick up an object</button>
+      <button type="button">move an object somewhere else</button>
+      <button type="button">wave hello</button>
+      <button type="button">push something to the left</button>
+      <button type="button">tap the table three times</button>
+    </div>
+    <div id="goal-actions">
+      <button type="button" id="goal-cancel">cancel</button>
+      <button type="submit" id="goal-start">✦ start</button>
+    </div>
+  </form>
+</dialog>
 <script src="app.js"></script>
 </body>
 </html>

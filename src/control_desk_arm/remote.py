@@ -1,8 +1,8 @@
 """Stream the webcam to browsers over WebRTC and let one of them at a time drive the arm.
 
 Browsers find this PC through the signaling server in `signaling/`. Each one gets a peer connection
-with the video and a "control" data channel. Whoever takes control loses it after IDLE_BOOT_S
-without input, or when they leave.
+with the video and a "control" data channel. Whoever has control keeps it until they release it,
+leave, go quiet (page hidden, phone locked), or send no input for IDLE_BOOT_S.
 """
 
 import asyncio
@@ -21,15 +21,20 @@ import websockets
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.contrib.media import MediaRelay
 
+from control_desk_arm.autopilot import Autopilot
 from control_desk_arm.camera import Camera, CameraPose
-from control_desk_arm.teleop import Teleop
+from control_desk_arm.teleop import AXES, Teleop
 
 SIGNAL_URL = os.environ.get("ARM_SIGNAL_URL", "wss://167-99-173-249.sslip.io")
 TOKEN_FILE = Path(os.environ.get("APPDATA", Path.home() / ".config")) / "control-desk-arm" / "robot-token"
 
-IDLE_BOOT_S = 5.0
+IDLE_BOOT_S = 30.0  # no input from the controller for this long releases control
+SILENT_BOOT_S = 3.0  # the controller's page sends input 20 times a second; silence means it's gone
 REST_AFTER_S = 60.0  # with nobody in control this long, fold the arm and turn torque off
+MAX_GOAL_CHARS = 500
+PUSH_INTERVAL_S = 0.1  # autopilot updates (token counts, phase) go out at most this often
 MARKER_COLOR = (255, 255, 0)  # cyan (BGR)
+PLAN_COLOR = (255, 0, 255)  # magenta: where an autopilot move is headed
 
 log = logging.getLogger("arm-remote")
 
@@ -45,39 +50,51 @@ aioice.ice.get_host_addresses = _default_route_address
 
 
 class CameraTrack(VideoStreamTrack):
-    """The webcam, with the target grip point and a line down to the table drawn on it."""
-
-    def __init__(self, camera: Camera, pose: CameraPose, teleop: Teleop):
+    def __init__(self, render):
         super().__init__()
-        self.camera, self.pose, self.teleop = camera, pose, teleop
+        self.render = render
 
     async def recv(self) -> av.VideoFrame:
         pts, time_base = await self.next_timestamp()
-        img = self.camera.latest_frame()
-        img = np.zeros((480, 640, 3), np.uint8) if img is None else img.copy()
-        grip = self.teleop.grip
-        if grip is not None:
-            top, floor = self.pose.project([grip, (grip[0], grip[1], 0.0)]).astype(int)
-            cv2.line(img, tuple(top), tuple(floor), MARKER_COLOR, 1, cv2.LINE_AA)
-            cv2.circle(img, tuple(floor), 3, MARKER_COLOR, -1, cv2.LINE_AA)
-            cv2.circle(img, tuple(top), 6, MARKER_COLOR, 2, cv2.LINE_AA)
-        frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+        frame = av.VideoFrame.from_ndarray(self.render(), format="bgr24")
         frame.pts, frame.time_base = pts, time_base
         return frame
 
 
 class Remote:
     def __init__(self, camera: Camera, pose: CameraPose):
+        self.camera, self.pose = camera, pose
         self.teleop = Teleop(pose)
-        self.track = CameraTrack(camera, pose, self.teleop)
+        self.autopilot = Autopilot(self.teleop, self.render, self._autopilot_changed)
+        self.last_push = 0.0
+        self.push_pending = False
+        self.track = CameraTrack(self.render)
         self.relay = MediaRelay()
         self.peers: dict[str, RTCPeerConnection] = {}
         self.channels: dict[str, object] = {}
         self.controller: str | None = None
-        self.last_active = 0.0
+        self.last_active = 0.0  # last real input from the controller
+        self.last_heard = 0.0  # last message of any kind from the controller
         self.free_since = time.monotonic()
         self.ice: list[RTCIceServer] = []
         self.ws = None
+
+    def render(self) -> np.ndarray:
+        """The webcam, with the grip point (and any planned move's target) marked down to the table, and a
+        bar through the grip point along the line the jaws close on."""
+        img = self.camera.latest_frame()
+        img = np.zeros((480, 640, 3), np.uint8) if img is None else img.copy()
+        if self.teleop.grip is not None:
+            a, b = self.pose.project(self.teleop.jaw_ends()).astype(int)
+            cv2.line(img, tuple(a), tuple(b), (0, 0, 0), 5, cv2.LINE_AA)
+            cv2.line(img, tuple(a), tuple(b), (255, 255, 255), 2, cv2.LINE_AA)
+        for point, color in ((self.teleop.plan_target, PLAN_COLOR), (self.teleop.grip, MARKER_COLOR)):
+            if point is not None:
+                top, floor = self.pose.project([point, (point[0], point[1], 0.0)]).astype(int)
+                cv2.line(img, tuple(top), tuple(floor), color, 1, cv2.LINE_AA)
+                cv2.circle(img, tuple(floor), 3, color, -1, cv2.LINE_AA)
+                cv2.circle(img, tuple(top), 6, color, 2, cv2.LINE_AA)
+        return img
 
     async def run(self) -> None:
         token = TOKEN_FILE.read_text().strip()
@@ -141,14 +158,28 @@ class Remote:
         except (TypeError, ValueError):
             return
         kind = msg.get("type")
-        if kind == "take" and self.controller is None:
-            self.controller, self.last_active = peer, time.monotonic()
-            self._broadcast_status()
-            asyncio.ensure_future(self._power_on())
-        elif kind == "release" and self.controller == peer:
+        if kind == "take":
+            if self.controller is None:
+                self.controller = peer
+                self.last_active = self.last_heard = time.monotonic()
+                self._broadcast_status()
+                asyncio.ensure_future(self._power_on())
+            return
+        if self.controller != peer:
+            return  # only the controller can do anything else
+        self.last_heard = time.monotonic()
+        if kind == "release":
             self._release("released")
-        elif kind == "input" and self.controller == peer:
-            values = [float(msg.get(k) or 0) for k in ("x", "y", "z", "wrist", "grip")]
+        elif kind == "autopilot":
+            goal = str(msg.get("goal", "")).strip()[:MAX_GOAL_CHARS]
+            if goal and self.teleop.state == "on":
+                self.autopilot.start(goal)
+                self._broadcast_status()
+        elif kind == "autopilot_stop":
+            self.autopilot.stop()
+            self._broadcast_status()
+        elif kind == "input" and not self.autopilot.on:
+            values = [float(msg.get(k) or 0) for k in AXES]
             self.teleop.set_input(*values)
             if any(abs(v) > 0.05 for v in values):
                 self.last_active = time.monotonic()
@@ -160,7 +191,7 @@ class Remote:
 
     def _release(self, reason: str) -> None:
         peer, self.controller = self.controller, None
-        self.teleop.stop()
+        self.autopilot.stop()
         self.free_since = time.monotonic()
         self._send(peer, {"type": "dropped", "reason": reason})
         self._broadcast_status()
@@ -169,11 +200,31 @@ class Remote:
         while True:
             await asyncio.sleep(0.25)
             now = time.monotonic()
-            if self.controller and self.teleop.state != "starting" and now - self.last_active > IDLE_BOOT_S:
+            if self.autopilot.on:
+                self.last_active = now
+            if self.controller and now - self.last_heard > SILENT_BOOT_S:
+                self._release("gone")
+            elif self.controller and self.teleop.state != "starting" and now - self.last_active > IDLE_BOOT_S:
                 self._release("idle")
             if not self.controller and self.teleop.state == "on" and now - self.free_since > REST_AFTER_S:
                 await asyncio.to_thread(self.teleop.power_off)
             self._broadcast_status()
+
+    def _autopilot_changed(self) -> None:
+        """Push autopilot progress to every page right away, throttled to PUSH_INTERVAL_S."""
+        if self.push_pending:
+            return
+        wait = self.last_push + PUSH_INTERVAL_S - time.monotonic()
+        if wait > 0:
+            self.push_pending = True
+            asyncio.get_running_loop().call_later(wait, self._push)
+        else:
+            self._push()
+
+    def _push(self) -> None:
+        self.push_pending = False
+        self.last_push = time.monotonic()
+        self._broadcast_status()
 
     def _send_status(self, peer: str) -> None:
         idle_left = None
@@ -185,6 +236,7 @@ class Remote:
             "busy": self.controller not in (None, peer),
             "viewers": len(self.peers),
             "idle_left": idle_left,
+            "autopilot": self.autopilot.status(),
             **self.teleop.status(),
         })
 
@@ -205,7 +257,7 @@ class Remote:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s", force=True)
-    for noisy in ("aioice", "aiortc", "websockets"):
+    for noisy in ("aioice", "aiortc", "websockets", "httpx"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     camera = Camera()
     remote = Remote(camera, CameraPose())

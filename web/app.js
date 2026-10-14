@@ -4,12 +4,19 @@ const params = new URLSearchParams(location.search);
 const SIGNAL = params.get("signal") || "wss://167-99-173-249.sslip.io";
 const RELAY_ONLY = params.has("relay"); // force traffic through the TURN server, for testing
 const SEND_HZ = 20;
+const DROP_REASONS = {
+  idle: "control released after 30 s without input",
+  gone: "control released: page went to the background",
+};
 
 const $ = (id) => document.getElementById(id);
-const video = $("video"), statusEl = $("status"), takeBtn = $("take"), info = $("info"), pad = $("pad");
+const video = $("video"), statusEl = $("status"), info = $("info");
+const pilot = $("pilot"), pilotGoal = $("pilot-goal"), pilotPhase = $("pilot-phase"), pilotStats = $("pilot-stats");
+const takeBtn = $("take"), autoBtn = $("auto"), pad = $("pad");
+const dialog = $("goal-dialog"), goalInput = $("goal");
 
 let ws, pc, dc, iceServers = [];
-let state = {}, note = "", route = "";
+let state = {}, note = "", route = "", wasAuto = false, thinkingSince = 0;
 
 // ---- connection ---------------------------------------------------------------------------------
 
@@ -93,8 +100,17 @@ function send(msg) {
 // ---- control state ------------------------------------------------------------------------------
 
 function onRobot(msg) {
-  if (msg.type === "status") state = msg;
-  if (msg.type === "dropped") note = msg.reason === "idle" ? "control released after 5 s idle" : "";
+  if (msg.type === "status") {
+    const auto = msg.autopilot || {};
+    if (wasAuto && !auto.on) {
+      if (auto.note) note = `autopilot: ${auto.note}`;
+      resetPad();
+    }
+    wasAuto = !!auto.on;
+    if (auto.phase === "thinking" && (state.autopilot || {}).phase !== "thinking") thinkingSince = performance.now();
+    state = msg;
+  }
+  if (msg.type === "dropped") note = DROP_REASONS[msg.reason] || "";
   render();
 }
 
@@ -105,21 +121,50 @@ function show(text) {
 function render() {
   const open = dc && dc.readyState === "open";
   const driving = !!state.you;
+  const auto = state.autopilot && state.autopilot.on ? state.autopilot : null;
+
   pad.hidden = !driving;
-  takeBtn.textContent = driving ? "release" : "take control";
+  document.body.classList.toggle("driving", driving);
+  pad.classList.toggle("auto", !!auto);
+  takeBtn.textContent = driving ? "release control" : !state.busy ? "take control" : auto ? "AI is driving" : "someone else is driving";
   takeBtn.disabled = !open || state.busy;
+  autoBtn.hidden = !(driving && state.arm === "on");
+  autoBtn.classList.toggle("on", !!auto);
+  autoBtn.textContent = auto ? "✦ stop autopilot" : "✦ autopilot";
+  pilot.hidden = !auto;
+  if (auto) {
+    pilotGoal.textContent = auto.goal;
+    pilotPhase.className = auto.phase;
+    pilotPhase.textContent =
+      auto.phase === "thinking" ? `thinking · ${((performance.now() - thinkingSince) / 1000).toFixed(1)} s`
+      : auto.phase === "executing" ? "executing"
+      : "starting…";
+    pilotStats.textContent = auto.tokens_out
+      ? `step ${auto.step} · ${auto.tokens_in} tokens in · ${auto.tokens_out} out · ${auto.tokens_per_s} tok/s · $${auto.cost.toFixed(3)}`
+      : `step ${auto.step}`;
+    if (driving) showInputs(auto.input);
+  }
 
   const parts = [];
   if (route) parts.push(route);
   if (state.viewers) parts.push(`${state.viewers} watching`);
-  if (state.busy) parts.push("someone else is driving");
   if (driving && state.arm === "starting") parts.push("starting arm…");
-  if (driving && state.arm === "on" && state.idle_left != null && state.idle_left < 3.5) {
+  if (driving && !auto && state.idle_left != null && state.idle_left < 10) {
     parts.push(`idle, releasing in ${Math.ceil(state.idle_left)}`);
   }
   if (state.error) parts.push(state.error);
-  if (!driving && note) parts.push(note);
+  if (note) parts.push(note);
   info.textContent = parts.join(" · ");
+}
+
+// Mirror the autopilot's controls on the pad, so you can see what it's pressing.
+function showInputs(input) {
+  const radius = stick.getBoundingClientRect().width / 2;
+  knob.style.transform = `translate(${input.x * radius}px, ${-input.y * radius}px)`;
+  for (const btn of document.querySelectorAll("#buttons button")) {
+    const value = input[btn.dataset.axis];
+    btn.classList.toggle("held", Math.sign(value) === Number(btn.dataset.dir));
+  }
 }
 
 takeBtn.onclick = () => {
@@ -127,9 +172,41 @@ takeBtn.onclick = () => {
   send({ type: state.you ? "release" : "take" });
 };
 
+autoBtn.onclick = () => {
+  if (state.autopilot && state.autopilot.on) {
+    send({ type: "autopilot_stop" });
+    state.autopilot.on = false; // show it stopped right away
+    render();
+    resetPad();
+  } else {
+    dialog.showModal();
+    // On phones, leave the keyboard down until they tap the box, so the suggestions stay visible.
+    if (matchMedia("(pointer: coarse)").matches) document.activeElement.blur();
+  }
+};
+
+for (const idea of document.querySelectorAll("#ideas button")) {
+  idea.onclick = () => { goalInput.value = idea.textContent; };
+}
+$("goal-cancel").onclick = () => dialog.close();
+$("goal-form").onsubmit = () => {
+  const goal = goalInput.value.trim();
+  if (!goal) return false;
+  note = "";
+  resetPad();
+  send({ type: "autopilot", goal });
+};
+
+// Leaving the page (tab closed, app switched, phone locked) gives up control, ending any autopilot.
+function leave() {
+  if (state.you) send({ type: "release" });
+}
+document.addEventListener("visibilitychange", () => document.hidden && leave());
+addEventListener("pagehide", leave);
+
 // ---- inputs -------------------------------------------------------------------------------------
 
-const touch = { x: 0, y: 0, z: 0, wrist: 0, grip: 0 };
+const touch = { x: 0, y: 0, z: 0, wrist: 0, grip: 0, tilt: 0 };
 const keys = new Set();
 
 // Joystick output is -1..1, with a small dead zone and a curve so small offsets give fine moves.
@@ -153,6 +230,12 @@ function resetStick() {
   stickPointer = null;
   knob.style.transform = "";
   touch.x = touch.y = 0;
+}
+
+function resetPad() {
+  resetStick();
+  for (const axis in touch) touch[axis] = 0;
+  for (const btn of document.querySelectorAll("#buttons button")) btn.classList.remove("held");
 }
 
 stick.addEventListener("pointerdown", (e) => {
@@ -184,10 +267,11 @@ const KEYMAP = {
   w: ["y", 1], arrowup: ["y", 1], s: ["y", -1], arrowdown: ["y", -1],
   d: ["x", 1], arrowright: ["x", 1], a: ["x", -1], arrowleft: ["x", -1],
   r: ["z", 1], f: ["z", -1], q: ["wrist", 1], e: ["wrist", -1], o: ["grip", 1], c: ["grip", -1],
+  t: ["tilt", 1], g: ["tilt", -1],
 };
 addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
-  if (k in KEYMAP && !e.metaKey && !e.ctrlKey) { keys.add(k); e.preventDefault(); }
+  if (k in KEYMAP && !e.metaKey && !e.ctrlKey && !dialog.open) { keys.add(k); e.preventDefault(); }
 });
 addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
 addEventListener("blur", () => keys.clear());
@@ -201,8 +285,12 @@ function currentInput() {
   return out;
 }
 
+// Sent continuously while in control: it's also how the robot knows this page is still here.
 setInterval(() => {
   if (state.you) send({ type: "input", ...currentInput() });
 }, 1000 / SEND_HZ);
+
+// Tick the thinking timer between updates from the robot.
+setInterval(() => state.autopilot && state.autopilot.phase === "thinking" && render(), 100);
 
 connectSignal();
