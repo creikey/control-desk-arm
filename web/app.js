@@ -7,6 +7,7 @@ const SEND_HZ = 20;
 const DROP_REASONS = {
   idle: "control released after 30 s without input",
   gone: "control released: page went to the background",
+  unavailable: "the arm isn't responding right now, try again in a minute",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -152,7 +153,6 @@ function render() {
   if (driving && !auto && state.idle_left != null && state.idle_left < 10) {
     parts.push(`idle, releasing in ${Math.ceil(state.idle_left)}`);
   }
-  if (state.error) parts.push(state.error);
   if (note) parts.push(note);
   info.textContent = parts.join(" · ");
 }

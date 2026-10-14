@@ -185,9 +185,9 @@ class Autopilot:
             self.note = "stopped after too many steps"
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except Exception:
             log.exception("autopilot failed")
-            self.note = f"error: {type(e).__name__}"
+            self.note = "stopped"
         finally:
             self.phase = ""
             self.teleop.stop()

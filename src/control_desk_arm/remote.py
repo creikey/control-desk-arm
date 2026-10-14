@@ -105,7 +105,10 @@ class Remote:
                     self.ws = ws
                     log.info("connected to %s", SIGNAL_URL)
                     async for raw in ws:
-                        await self._on_signal(json.loads(raw))
+                        try:
+                            await self._on_signal(json.loads(raw))
+                        except Exception:
+                            log.exception("couldn't handle a signaling message")
             except (OSError, websockets.WebSocketException) as e:
                 log.warning("signaling connection lost (%s); reconnecting", e)
             self.ws = None
@@ -185,8 +188,10 @@ class Remote:
                 self.last_active = time.monotonic()
 
     async def _power_on(self) -> None:
-        await asyncio.to_thread(self.teleop.power_on)
-        self.last_active = time.monotonic()  # starting up doesn't count as idle time
+        if await asyncio.to_thread(self.teleop.power_on):
+            self.last_active = time.monotonic()  # starting up doesn't count as idle time
+        elif self.controller:
+            self._release("unavailable")
         self._broadcast_status()
 
     def _release(self, reason: str) -> None:
@@ -199,16 +204,22 @@ class Remote:
     async def _watchdog(self) -> None:
         while True:
             await asyncio.sleep(0.25)
-            now = time.monotonic()
-            if self.autopilot.on:
-                self.last_active = now
-            if self.controller and now - self.last_heard > SILENT_BOOT_S:
-                self._release("gone")
-            elif self.controller and self.teleop.state != "starting" and now - self.last_active > IDLE_BOOT_S:
-                self._release("idle")
-            if not self.controller and self.teleop.state == "on" and now - self.free_since > REST_AFTER_S:
-                await asyncio.to_thread(self.teleop.power_off)
-            self._broadcast_status()
+            try:
+                await self._check()
+            except Exception:
+                log.exception("watchdog check failed")
+
+    async def _check(self) -> None:
+        now = time.monotonic()
+        if self.autopilot.on:
+            self.last_active = now
+        if self.controller and now - self.last_heard > SILENT_BOOT_S:
+            self._release("gone")
+        elif self.controller and self.teleop.state != "starting" and now - self.last_active > IDLE_BOOT_S:
+            self._release("idle")
+        if not self.controller and self.teleop.state == "on" and now - self.free_since > REST_AFTER_S:
+            await asyncio.to_thread(self.teleop.power_off)
+        self._broadcast_status()
 
     def _autopilot_changed(self) -> None:
         """Push autopilot progress to every page right away, throttled to PUSH_INTERVAL_S."""

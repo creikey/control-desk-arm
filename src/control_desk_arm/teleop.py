@@ -5,6 +5,7 @@ from the camera). Tilt swings the claw about the grip point between pointing str
 reaching out, away from the base.
 """
 
+import contextlib
 import logging
 import math
 import threading
@@ -25,6 +26,8 @@ GRIP_SPEED = 150.0  # deg/s
 TILT_SPEED = 45.0  # deg/s
 INPUT_STALE_S = 0.4  # stop if the input stream pauses (lag, lost packets)
 IK_TOLERANCE = 0.004
+START_ATTEMPTS = 5
+RECONNECT_AFTER = 15  # consecutive failed ticks (half a second) before reconnecting to the arm
 
 GRIPPER_OPEN = 90.0
 PITCH_RANGE = (-90.0, -20.0)  # degrees: straight down .. reaching well out
@@ -62,7 +65,6 @@ class Teleop:
         self.right, self.away = right / np.linalg.norm(right), away / np.linalg.norm(away)
 
         self.state = "off"  # off | starting | on | stopping
-        self.error: str | None = None
         self.grip: np.ndarray | None = None  # target grip point (m)
         self.claw = GRIPPER_OPEN
         self.pitch = POINTING_DEG
@@ -157,42 +159,40 @@ class Teleop:
         a, b = self.pose.project(self.jaw_ends())
         return math.degrees(math.atan2(a[1] - b[1], b[0] - a[0])) % 180
 
-    def power_on(self) -> None:
-        """Connect, move to the home pose with the claw open, and start the control loop. Blocking."""
-        with self._lock:
-            if self.state != "off":
-                return
-            self.state, self.error = "starting", None
-            try:
-                arm = make_arm(max_relative_target=None)
-                connect(arm)
-                calibrated = joint_limits(arm)
-                self._limits = {
-                    n: (max(lo, calibrated[n][0]), min(hi, calibrated[n][1])) for n, (lo, hi) in LIMITS_DEG.items()
-                }
-                joints = read_joints(arm)
-                # Hold where it is (it may have sagged past a limit while limp) rather than at a stale goal.
-                joints.update({n: float(np.clip(joints[n], lo, hi)) for n, (lo, hi) in self._limits.items()})
-                send_joints(arm, joints)
-                arm.bus.enable_torque(num_retry=3)
+    def power_on(self) -> bool:
+        """Connect, move to the home pose with the claw open, and start the control loop. Blocking.
 
-                home = {**joints, "wrist_roll": 0.0, "gripper": GRIPPER_OPEN}
-                for _ in range(4):  # the grip offset depends on the final wrist pose
-                    tip = HOME_GRIP - grip_offset(frames(home), 1.0)
-                    home, _, _ = solve_ik(tip, POINTING_DEG, home, limits=self._limits)
-                move_to(arm, home, duration=2.0)
-            except Exception as e:
-                log.exception("arm failed to start")
-                self.state, self.error = "off", f"{type(e).__name__}: {e}"
-                return
+        Retries a few times (a dropped packet or a tripped motor usually clears on the next try).
+        Returns whether the arm is running.
+        """
+        with self._lock:
+            if self.state == "on":
+                return True
+            self.state = "starting"
+            for attempt in range(START_ATTEMPTS):
+                try:
+                    arm, joints = self._open()
+                    home = {**joints, "wrist_roll": 0.0, "gripper": GRIPPER_OPEN}
+                    for _ in range(4):  # the grip offset depends on the final wrist pose
+                        tip = HOME_GRIP - grip_offset(frames(home), 1.0)
+                        home, _, _ = solve_ik(tip, POINTING_DEG, home, limits=self._limits)
+                    move_to(arm, home, duration=2.0)
+                    break
+                except Exception:
+                    log.exception("arm failed to start (attempt %d of %d)", attempt + 1, START_ATTEMPTS)
+                    time.sleep(1.0)
+            else:
+                self.state = "off"
+                return False
             self._arm, self.claw, self.pitch, self.joints = arm, GRIPPER_OPEN, POINTING_DEG, home
             self.grip = grip_point(home, 1.0)
             self.state = "on"
             self._thread = threading.Thread(target=self._loop, args=(home,), daemon=True)
             self._thread.start()
+            return True
 
     def power_off(self) -> None:
-        """Fold the arm up and release torque. Blocking."""
+        """Fold the arm up and release torque. Blocking; never raises."""
         with self._lock:
             if self.state != "on":
                 return
@@ -201,28 +201,66 @@ class Teleop:
             self._thread.join()
             try:
                 move_to(self._arm, REST_JOINTS, duration=2.5)
-            finally:
+            except Exception:
+                log.exception("couldn't fold the arm")
+            with contextlib.suppress(Exception):
                 release(self._arm)
-                self._arm, self.grip, self.state = None, None, "off"
+            self._arm, self.grip, self.state = None, None, "off"
 
     def status(self) -> dict:
         out = {"arm": self.state}
-        if self.error:
-            out["error"] = self.error
         if self.grip is not None:
             out["grip_cm"] = [round(float(v) * 100, 1) for v in self.grip]
             out["claw"] = round(self.claw)
         return out
 
+    def _open(self):
+        """Connect and hold the arm where it is. Returns (arm, joints); frees the port on failure."""
+        arm = make_arm(max_relative_target=None)
+        try:
+            connect(arm)
+            calibrated = joint_limits(arm)
+            self._limits = {
+                n: (max(lo, calibrated[n][0]), min(hi, calibrated[n][1])) for n, (lo, hi) in LIMITS_DEG.items()
+            }
+            joints = read_joints(arm)
+            # Hold where it is (it may have sagged past a limit while limp) rather than at a stale goal.
+            joints.update({n: float(np.clip(joints[n], lo, hi)) for n, (lo, hi) in self._limits.items()})
+            send_joints(arm, joints)
+            arm.bus.enable_torque(num_retry=3)
+            return arm, joints
+        except Exception:
+            with contextlib.suppress(Exception):
+                arm.bus.disconnect(disable_torque=False)
+            raise
+
+    def _reconnect(self, joints: dict[str, float]) -> None:
+        """Reopen the connection to the arm and send it back to where it was meant to be."""
+        log.warning("lost the arm; reconnecting")
+        with contextlib.suppress(Exception):
+            self._arm.bus.disconnect(disable_torque=False)
+        try:
+            self._arm, _ = self._open()
+            send_joints(self._arm, joints)
+        except Exception:
+            log.exception("reconnect failed; will retry")
+            time.sleep(1.0)
+
     def _loop(self, joints: dict[str, float]) -> None:
         next_tick = time.perf_counter()
+        failures = 0
         while self.state == "on":
             next_tick += 1 / HZ
             try:
                 joints = self._tick(joints)
-            except Exception as e:
-                log.exception("control loop failed")
-                self.error = f"{type(e).__name__}: {e}"
+                failures = 0
+            except Exception:
+                failures += 1
+                if failures == 1:
+                    log.exception("control tick failed")
+                if failures >= RECONNECT_AFTER:
+                    self._reconnect(joints)
+                    failures = 0
             time.sleep(max(0.0, next_tick - time.perf_counter()))
             next_tick = max(next_tick, time.perf_counter() - 1 / HZ)
 

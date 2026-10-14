@@ -36,11 +36,6 @@ def connect(arm: SOFollower) -> None:
     A tripped motor drops out of LeRobot's startup check, and stays tripped until its torque is
     switched on again.
     """
-    try:
-        arm.connect(calibrate=False)
-        return
-    except RuntimeError:
-        pass
     bus = arm.bus
     bus.connect(handshake=False)
     ph, port = bus.packet_handler, bus.port_handler
