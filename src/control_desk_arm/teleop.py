@@ -16,7 +16,15 @@ import numpy as np
 
 from control_desk_arm.arm import connect, joint_limits, make_arm, move_to, read_joints, release, send_joints
 from control_desk_arm.camera import CameraPose
-from control_desk_arm.kinematics import LIMITS_DEG, POINTING_DEG, frames, grip_offset, grip_point, solve_ik
+from control_desk_arm.kinematics import (
+    GRIP_OFFSET,
+    LIMITS_DEG,
+    POINTING_DEG,
+    frames,
+    grip_offset,
+    grip_point,
+    solve_ik,
+)
 
 HZ = 30.0
 MOVE_SPEED = 0.10  # m/s at full input
@@ -26,6 +34,9 @@ GRIP_SPEED = 150.0  # deg/s
 TILT_SPEED = 45.0  # deg/s
 INPUT_STALE_S = 0.4  # stop if the input stream pauses (lag, lost packets)
 IK_TOLERANCE = 0.004
+JOINT_SPEED = 60.0  # deg/s for the fastest joint during a planned move
+PAN_AXIS_X = 0.0388  # where the base turns, in front of the origin (so101_new_calib.urdf)
+ARM_JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
 START_ATTEMPTS = 5
 RECONNECT_AFTER = 15  # consecutive failed ticks (half a second) before reconnecting to the arm
 
@@ -48,11 +59,15 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Plan:
-    """A move run as the inputs a person would hold, for exactly `ticks` control ticks."""
+    """A move, run for exactly `ticks` control ticks. With a `path`, the arm follows those joint angles
+    (one per tick); otherwise it holds `input` like a person would. `input` is also what the page's
+    controls show either way."""
 
     input: tuple[float, ...]
     ticks: int
     target: np.ndarray  # where the grip point will end up
+    path: list[dict[str, float]] | None = None
+    pitch: float = POINTING_DEG
     done: threading.Event = field(default_factory=threading.Event)
 
 
@@ -117,17 +132,75 @@ class Teleop:
             tilt_deg / (TILT_SPEED * t),
         )
         target = self.grip + self.right * right + self.away * away + np.array([0.0, 0.0, up])
+        pitch = self.pitch + tilt_deg
+        claw_goal = self.claw + claw_change
+        roll = float(np.clip(self.joints["wrist_roll"] + wrist_deg, *self._limits["wrist_roll"]))
+        path = self._joint_path(target, pitch, claw_goal, roll, seconds)
+        if path:
+            ticks = len(path)
+            inputs = tuple(float(np.clip(v * t * HZ / ticks, -1, 1)) for v in inputs)  # same move, new duration
         self.stop()
-        self._plan = Plan(inputs, ticks, target)
+        self._plan = Plan(inputs, ticks, target, path, pitch)
         self.applied = inputs
         return self._plan
 
-    def table_point(self, u: float, v: float) -> np.ndarray:
-        """The point on the table (z = 0) seen at image pixel (u, v)."""
+    def _joint_path(
+        self, grip: np.ndarray, pitch: float, claw: float, roll: float, min_seconds: float
+    ) -> list[dict[str, float]] | None:
+        """Joint angles for each tick of a smooth move to put the grip point at `grip`, or None if no
+        arm pose reaches it. Every joint moves at once, so the arm can't get stuck partway the way a
+        straight-line move can; if that would sweep the fingertips toward the table, it goes via a
+        raised waypoint."""
+        goal = self._solve(grip, pitch, claw, roll)
+        if goal is None:
+            return None
+        start = dict(self.joints)
+        waypoints = [start, goal]
+        lowest = min(self._fingertip_z(start), self._fingertip_z(goal))
+        if min(self._fingertip_z(j) for j in _blend(start, goal, 20)) < min(lowest - 0.01, 0.02):
+            above = self.grip.copy()
+            above[2] = max(self.grip[2], grip[2]) + 0.06
+            via = self._solve(above, pitch, claw, roll)
+            if via is not None:
+                waypoints = [start, via, goal]
+        path = []
+        for a, b in zip(waypoints, waypoints[1:]):
+            biggest = max(abs(b[n] - a[n]) for n in ARM_JOINTS)
+            seconds = max(biggest / JOINT_SPEED, min_seconds / (len(waypoints) - 1))
+            path += _blend(a, b, max(1, math.ceil(seconds * HZ)))
+        return path
+
+    def _solve(self, grip: np.ndarray, pitch: float, claw: float, roll: float) -> dict[str, float] | None:
+        """The reachable arm pose closest to the current one that puts the grip point at `grip`."""
+        pan = math.degrees(math.atan2(grip[1], grip[0] - PAN_AXIS_X))
+        seeds = [self.joints] + [
+            {**self.joints, "shoulder_pan": pan, "shoulder_lift": lift, "elbow_flex": elbow, "wrist_flex": 70.0}
+            for lift, elbow in ((0.0, 0.0), (-40.0, 50.0), (30.0, -30.0), (-70.0, 85.0))
+        ]
+        best, best_cost = None, math.inf
+        for pitch_weight in (0.1, 0.005):  # exact angle if possible, else let the claw tilt a little
+            for seed in seeds:
+                joints = {**seed, "wrist_roll": roll, "gripper": claw}
+                for _ in range(4):  # the grip offset depends on the final wrist pose
+                    tip = grip - grip_offset(frames(joints), claw / GRIPPER_OPEN)
+                    joints, err, _ = solve_ik(tip, pitch, joints, pitch_weight=pitch_weight, limits=self._limits)
+                cost = sum(abs(joints[n] - self.joints[n]) for n in ARM_JOINTS)
+                if err <= IK_TOLERANCE and cost < best_cost:
+                    best, best_cost = joints, cost
+            if best is not None:
+                return best
+        return None
+
+    @staticmethod
+    def _fingertip_z(joints: dict[str, float]) -> float:
+        return float(frames(joints)[-1][2, 3])
+
+    def table_point(self, u: float, v: float, height: float = 0.0) -> np.ndarray:
+        """The point at `height` meters above the table seen at image pixel (u, v)."""
         R, t = self.pose.R, self.pose.tvec
         center = -R.T @ t
         ray = R.T @ np.linalg.solve(self.pose.K, [u, v, 1.0])
-        return center + ray * (-center[2] / ray[2])
+        return center + ray * ((height - center[2]) / ray[2])
 
     def table_offset(self, delta: np.ndarray) -> tuple[float, float]:
         """Split a horizontal move into its `right` and `away` parts (meters)."""
@@ -143,21 +216,30 @@ class Teleop:
     def fingertip_z(self) -> float:
         return float(frames(self.joints)[-1][2, 3])
 
-    def jaw_ends(self, half_length: float = 0.03) -> np.ndarray:
-        """Two points either side of the grip point along the line the jaws close on (seen from above).
+    def jaw_tips(self) -> tuple[np.ndarray, np.ndarray]:
+        """Where the two jaws grip, at fingertip height: the fixed fingertip, and the point the moving
+        jaw reaches across from it at the current opening. Whatever lies between them gets squeezed.
 
         The moving jaw hinges about the gripper frame's y axis and the fingers point along its -z, so
         the jaws close along its x axis (so101_new_calib.urdf).
         """
-        axis = frames(self.joints)[4][:3, 0].copy()
-        axis[2] = 0.0
-        axis *= half_length / np.linalg.norm(axis)
-        return np.array([self.grip - axis, self.grip + axis])
+        f = frames(self.joints)
+        fixed = f[-1][:3, 3]
+        width = 2 * GRIP_OFFSET[0] * self.claw / GRIPPER_OPEN
+        return fixed, fixed + self._closing_axis(f) * width
 
     def jaw_image_angle(self) -> float:
-        """The jaws' closing line in the camera image, in degrees counterclockwise from pointing right."""
-        a, b = self.pose.project(self.jaw_ends())
+        """The line the jaws close along, in degrees counterclockwise from pointing right in the image."""
+        f = frames(self.joints)
+        fixed = f[-1][:3, 3]
+        a, b = self.pose.project([fixed, fixed + self._closing_axis(f) * 0.05])
         return math.degrees(math.atan2(a[1] - b[1], b[0] - a[0])) % 180
+
+    @staticmethod
+    def _closing_axis(f: list[np.ndarray]) -> np.ndarray:
+        across = f[4][:3, 0].copy()
+        across[2] = 0.0
+        return across / np.linalg.norm(across)
 
     def power_on(self) -> bool:
         """Connect, move to the home pose with the claw open, and start the control loop. Blocking.
@@ -267,6 +349,18 @@ class Teleop:
     def _tick(self, joints: dict[str, float]) -> dict[str, float]:
         dt = 1 / HZ
         plan = self._plan
+        if plan and plan.path:
+            goal = plan.path[len(plan.path) - plan.ticks]
+            plan.ticks -= 1
+            if plan.ticks <= 0:
+                self._plan, self.pitch = None, plan.pitch
+                plan.done.set()
+            self.applied = plan.input
+            self.claw = goal["gripper"]
+            self.grip = grip_point(goal, self.claw / GRIPPER_OPEN)
+            send_joints(self._arm, goal)
+            self.joints = goal
+            return goal
         if plan:
             inputs = plan.input
             plan.ticks -= 1
@@ -306,3 +400,13 @@ class Teleop:
         send_joints(self._arm, goal)
         self.joints = goal
         return goal
+
+
+def _blend(a: dict[str, float], b: dict[str, float], steps: int) -> list[dict[str, float]]:
+    """`steps` poses easing from `a` to `b` (ending exactly at `b`)."""
+    out = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        t = t * t * (3 - 2 * t)
+        out.append({n: a[n] + (b[n] - a[n]) * t for n in b})
+    return out

@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import time
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable
@@ -21,54 +22,73 @@ import cv2
 import numpy as np
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
-from control_desk_arm.teleop import AXES, GRIPPER_OPEN, Teleop
+from control_desk_arm.teleop import AXES, Teleop
 
 MODEL = os.environ.get("ARM_AUTOPILOT_MODEL", "google/gemini-4-argon")
+# At "low", Argon sometimes misjudges a successful grab as a miss and reopens the claw; "medium" doesn't.
+REASONING_EFFORT = "medium"
 KEY_FILE = Path(os.environ.get("APPDATA", Path.home() / ".config")) / "control-desk-arm" / "openrouter-api-key"
 SETTLE_S = 0.3  # keep filming briefly after a move, so the video ends on where the arm landed
 FPS = 10
 CLIP_S = 6.0  # Gemini samples about one frame per second, so clips are slowed to play this long
-MAX_STEPS = 120
+MAX_STEPS = 30
 KEEP_MEDIA = 2  # older observations drop their image or video
+DUMP_DIR = os.environ.get("ARM_AUTOPILOT_DUMP")  # if set, save each observation here for debugging
 
-SYSTEM_PROMPT = """You drive a small robot arm on a desk to accomplish the user's goal. You see the same webcam view as the people watching. The cyan ring marks the claw's grip point (the middle of the open claw); the cyan line drops from it straight down to a dot on the table, directly below the claw. The short white bar through the ring is the line the two jaws close along: an object is only gripped if it sits between the jaws across that bar. While a move runs, a magenta ring and dot show where it is headed.
+SYSTEM_PROMPT = """You drive a small robot arm on a desk to accomplish the user's goal. You see the same webcam view as the people watching. Overlaid on the image: a white line at fingertip height shows where the jaws grip. It runs from the fixed jaw's fingertip to where the moving jaw reaches at the current opening (a dot at each end); when the claw closes, whatever crosses that line gets squeezed. The cyan ring is the grip point, midway between the jaws. The translucent cyan disk is on the table, directly under the claw (like a shadow, about the claw's width), with a line up to the ring; since it lies on the table, objects standing on that spot cover it. While a move runs, a magenta ring and disk outline show where it is headed.
 
-The claw reaches about 30 cm out from the robot's base (a little more when tilted out); it can't get to things beyond that.
+The claw reaches between about 15 and 30 cm out from the robot's base (the base is at the left of the image): it can't get to things further away, or right next to the base. If a move stops short, its target is out of reach.
 
 Each turn, call one tool: `go_over`, `move`, or, once the goal is done or clearly impossible, `finish`.
 
-`go_over` takes a point in the camera image (x from the left edge, y from the top, both 0 to 1000) and moves the claw sideways so the dot under it lands on that spot of the table, keeping its height. Point at where the object sits on the table, at the middle of its base. This is the accurate way to get over an object; use it first, then fine-tune with `move`.
+`go_over` takes a point in the camera image (x from the left edge, y from the top, both 0 to 1000) and the height of what you're pointing at, and moves the claw sideways so it is straight above that point, keeping its own height. Point at the middle of the object's top surface and give that surface's height above the table in cm (a 2x2 Rubik's cube is about 5 cm tall); for a spot on the table itself, use 0. This is the accurate way to get over an object; use it first, then fine-tune with `move`.
 
 `move` is relative to where the claw is now, in directions on the table as seen in the image:
 - right_cm: toward the right of the image (negative: left).
 - away_cm: away from the camera, up the image (negative: toward the camera).
 - up_cm: up (negative: down).
-- wrist_deg: turn the claw about its vertical axis. Positive turns the white bar counterclockwise in the image.
+- wrist_deg: turn the claw about its vertical axis. Positive turns the white line counterclockwise in the image.
 - tilt_deg: tilt the claw about the grip point. Positive swings its fingertips outward, away from the robot's base; negative brings it back toward pointing straight down. Useful to reach over or around things, or to grab something from the side; straight down is best for most picks.
 - claw: how open the claw should be, 0 (shut) to 1 (wide open). Leave it out to keep it as is.
 Everything in a move happens at once and arrives together, so split moves when the order matters (for example: open, then lower, then close, then lift). Moves are exact; make small corrections when you're close.
 
-After each move you get a slowed-down video of it, a close-up of the claw at the end, and the claw's state, including whether the move reached its target (it stops short when the target is out of reach).
+After each move you get a slowed-down video of it, a close-up of the claw at the end, and the claw's height, tilt and jaw direction, plus a note if the move didn't reach its target (it stops short when the target is out of reach).
 
 To pick something up:
-1. `go_over` the middle of the object, with the claw high enough to clear it.
-2. Turn the wrist so the white bar crosses the object: across a long thin object like a pencil, and straight across two opposite faces of a box or cube (not across its corners). Open the claw fully.
-3. Lower until the fingertips are about 1 cm above the table, so the jaws surround the object's lower half. Check the close-up: the object should sit between the jaws, centered on the bar. Correct with small moves before closing.
-4. Close the claw, lift 5 cm, and check the close-up shows the object held off the table. If it slipped, open, and try again from step 1."""
+1. `go_over` the middle of the object's top surface, with the claw high enough to clear it.
+2. Turn the wrist so the white line between the fingertips crosses the object: across a long thin object like a pencil, and straight across two opposite faces of a box or cube (not across its corners). Open the claw fully.
+3. Lower until the fingertips are about 1 cm above the table, so the jaws surround the object's lower half.
+4. Before closing, look at the claw itself in the close-up, not the overlay (the overlay is drawn on top of everything, so its lines can look like they're on an object that is actually behind or in front of them). The fixed jaw should be right beside one side of the object and the open moving jaw beyond the opposite side, with the object centered between them. If either jaw is in front of the object (covering it from the camera), on top of it, or touching it, the claw is off-center: move to center the object between the jaws first, then check again.
+5. Close the claw (a move with only `claw: 0`), then lift 5 cm.
+6. Check the video and close-up: if the object came up with the claw, you have it. Only if the object was left behind on the table, open and try again from step 1.
+
+Opening the claw drops whatever it holds. To put a held object somewhere:
+1. Find the destination in the full camera view (not the close-up, which only shows the area around the claw).
+2. `go_over` the middle of the destination's surface, with the object held high enough to clear things on the way.
+3. Lower until the object is just above the destination's surface (about 1 cm).
+4. Open the claw in a move of its own, then lift away and check the object stayed there.
+
+If you're stuck after a few tries, call `finish` and say why."""
 
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "go_over",
-            "description": "Move the claw sideways so the dot under it lands on this point of the table in the image.",
+            "description": "Move the claw sideways so it is straight above this point in the image.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "x": {"type": "number", "minimum": 0, "maximum": 1000, "description": "From the left edge."},
                     "y": {"type": "number", "minimum": 0, "maximum": 1000, "description": "From the top edge."},
+                    "height_cm": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 30,
+                        "description": "Height above the table of the surface you're pointing at.",
+                    },
                 },
-                "required": ["x", "y"],
+                "required": ["x", "y", "height_cm"],
             },
         },
     },
@@ -130,6 +150,7 @@ class Autopilot:
     def start(self, goal: str) -> None:
         self.stop()
         self.goal, self.note, self.step, self.cost = goal, "", 0, 0.0
+        self._run_id = time.strftime("%Y%m%d-%H%M%S")
         self._task = asyncio.create_task(self._run(goal))
 
     def stop(self) -> None:
@@ -161,7 +182,10 @@ class Autopilot:
         result = ""
         try:
             for _ in range(MAX_STEPS):
-                messages.append(_observation_message(f"{result}{self._claw_state()}", observation))
+                state = f"{result}{self._claw_state()}"
+                log.info("state: %s", state)
+                self._dump(state, observation)
+                messages.append(_observation_message(state, observation))
                 _forget_old_media(messages)
                 message = await self._complete(messages)
                 messages.append(message)
@@ -200,10 +224,21 @@ class Autopilot:
     def _claw_state(self) -> str:
         t = self.teleop
         return (
-            f"Fingertips {t.fingertip_z * 100:.1f} cm above the table, claw {t.claw / GRIPPER_OPEN:.0%} open, "
+            f"Fingertips {t.fingertip_z * 100:.1f} cm above the table, "
             f"tilted {t.pitch + 90:.0f} degrees out from straight down, "
             f"jaws closing along {t.jaw_image_angle():.0f} degrees in the image (counterclockwise from pointing right)."
         )
+
+    def _dump(self, state: str, media: list[tuple[str, str, bytes]]) -> None:
+        if not DUMP_DIR:
+            return
+        folder = Path(DUMP_DIR) / self._run_id
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{self.step:03d}.txt").write_text(state)
+        grip = ", ".join(f"{v * 100:.1f}" for v in self.teleop.grip)
+        (folder / f"{self.step:03d}_grip.txt").write_text(grip)
+        for i, (_, kind, data) in enumerate(media):
+            (folder / f"{self.step:03d}_{i}.{'jpg' if kind == 'image' else 'mp4'}").write_bytes(data)
 
     def _closeup(self, img: np.ndarray, half: int = 120) -> bytes:
         """A 2x crop of the frame around the grip point."""
@@ -219,12 +254,15 @@ class Autopilot:
         a note on whether it got there."""
         if name == "go_over":
             h, w = self.render().shape[:2]
-            spot = self.teleop.table_point(float(args["x"]) / 1000 * w, float(args["y"]) / 1000 * h)
+            spot = self.teleop.table_point(
+                float(args["x"]) / 1000 * w, float(args["y"]) / 1000 * h, float(args.get("height_cm") or 0) / 100
+            )
             right, away = self.teleop.table_offset(spot - self.teleop.grip)
             args = {"right_cm": right * 100, "away_cm": away * 100}
         cm = {key: float(args.get(key) or 0) / 100 for key in ("right_cm", "away_cm", "up_cm")}
         claw = args.get("claw")
-        plan = self.teleop.plan_move(
+        plan = await asyncio.to_thread(
+            self.teleop.plan_move,
             cm["right_cm"], cm["away_cm"], cm["up_cm"], float(args.get("wrist_deg") or 0),
             float(args.get("tilt_deg") or 0), None if claw is None else float(claw),
         )
@@ -264,7 +302,7 @@ class Autopilot:
         self._set_phase("thinking")
         start = loop.time()
         response = await self.client.chat.completions.create(
-            model=MODEL, messages=messages, tools=TOOLS, reasoning_effort="low"
+            model=MODEL, messages=messages, tools=TOOLS, reasoning_effort=REASONING_EFFORT
         )
         usage = response.usage
         self.tokens_in, self.tokens_out = usage.prompt_tokens, usage.completion_tokens
