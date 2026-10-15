@@ -56,6 +56,9 @@ EXTERNAL_IP=$PUBLIC_IP
 [ "$PRIVATE_IP" != "$PUBLIC_IP" ] && EXTERNAL_IP="$PUBLIC_IP/$PRIVATE_IP"
 cat > /etc/turnserver.conf <<EOF
 listening-port=3478
+# Relay from the address the internet routes to, not loopback (where HAProxy hands over TLS clients)
+# or the droplet's private addresses.
+relay-ip=$PRIVATE_IP
 external-ip=$EXTERNAL_IP
 realm=$DOMAIN
 use-auth-secret
