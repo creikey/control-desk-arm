@@ -23,6 +23,7 @@ from websockets.asyncio.server import ServerConnection, broadcast, serve
 ROBOT_TOKEN = os.environ["ROBOT_TOKEN"]
 TURN_SECRET = os.environ.get("TURN_SECRET", "")
 PUBLIC_IP = os.environ.get("PUBLIC_IP", "")
+TURN_DOMAIN = os.environ.get("TURN_DOMAIN", "")  # TURN over TLS on 443, for networks that block 3478
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8765"))
 
@@ -41,8 +42,11 @@ def ice_servers(turn: bool) -> list[dict]:
     if turn and TURN_SECRET:
         username = f"{int(time.time()) + CREDENTIAL_TTL_S}:arm"
         digest = hmac.new(TURN_SECRET.encode(), username.encode(), hashlib.sha1).digest()
+        urls = [f"turn:{PUBLIC_IP}:3478?transport=udp", f"turn:{PUBLIC_IP}:3478?transport=tcp"]
+        if TURN_DOMAIN:
+            urls.append(f"turns:{TURN_DOMAIN}:443?transport=tcp")
         servers.append({
-            "urls": [f"turn:{PUBLIC_IP}:3478?transport=udp", f"turn:{PUBLIC_IP}:3478?transport=tcp"],
+            "urls": urls,
             "username": username,
             "credential": base64.b64encode(digest).decode(),
         })
