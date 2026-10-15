@@ -69,8 +69,8 @@ no-dtls
 no-multicast-peers
 min-port=49152
 max-port=49352
-user-quota=8
-total-quota=64
+user-quota=16
+total-quota=256
 max-bps=2000000
 denied-peer-ip=0.0.0.0-0.255.255.255
 denied-peer-ip=10.0.0.0-10.255.255.255
