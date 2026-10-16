@@ -80,15 +80,21 @@ async function connectPeer() {
   for (const msg of early) ws.send(msg);
 }
 
+// Kept up to date while connected: ICE often connects through TURN first and moves to a direct
+// path a few seconds later.
 async function showRoute(peer) {
-  const stats = await peer.getStats();
-  for (const s of stats.values()) {
-    const pair = s.type === "transport" && stats.get(s.selectedCandidatePairId);
-    if (!pair) continue;
-    const ends = [stats.get(pair.localCandidateId), stats.get(pair.remoteCandidateId)];
-    route = ends.some((c) => c && c.candidateType === "relay") ? "relayed via TURN" : "direct";
+  while (peer === pc && peer.connectionState === "connected") {
+    const stats = await peer.getStats();
+    if (peer !== pc) return;
+    for (const s of stats.values()) {
+      const pair = s.type === "transport" && stats.get(s.selectedCandidatePairId);
+      if (!pair) continue;
+      const ends = [stats.get(pair.localCandidateId), stats.get(pair.remoteCandidateId)];
+      route = ends.some((c) => c && c.candidateType === "relay") ? "relayed via TURN" : "direct";
+    }
+    render();
+    await new Promise((r) => setTimeout(r, 2000));
   }
-  render();
 }
 
 function closePeer() {
